@@ -2,11 +2,11 @@
 %% This is a wrapper for the Socket connection
 %% @author Dave Bryson [http://weblog.miceda.org]
 %%
--module(websocket_request,[Socket]).
+-module(websocket_request,[Socket, Path]).
 
 -export([get/1, get_data/0, send/1]).
 
-%% Get the Socket if you need it
+get(path)   -> Path;
 get(socket) -> Socket.
 
 %% Return the data from the Socket. Parse it from the WebSocket format

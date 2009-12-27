@@ -129,11 +129,11 @@ headers(Socket, Request, Headers, _Body, ?MAX_HEADERS) ->
 headers(Socket, Request, Headers, {WwwLoop, WSLoop}, HeaderCount) ->
     case gen_tcp:recv(Socket, 0, ?IDLE_TIMEOUT) of
         {ok, http_eoh} ->
-            {_, Path, _} = Request,
+            {_, {abs_path,Path}, _} = Request,
 	        case websocket_check(Socket, Path, Headers) of
                 true ->  % a websocket request
             		inet:setopts(Socket, [{packet, raw}]),
-                    WSRequest = websocket_request:new(Socket),
+                    WSRequest = websocket_request:new(Socket,Path),
                     WSLoop(WSRequest);
 	            false -> % normal http request
 		            inet:setopts(Socket, [{packet, raw}]),
@@ -161,8 +161,7 @@ after_response(Body, Req) ->
             ?MODULE:loop(Socket, Body)
     end.
 
-websocket_check(Socket,PathA,Headers) ->
-    {abs_path,Path} = PathA,
+websocket_check(Socket,Path,Headers) ->
     case proplists:get_value('Upgrade',Headers) of
         "WebSocket" ->
             websocket_send_handshake(Socket,Path,Headers), 

@@ -41,6 +41,7 @@ loop(Req, DocRoot) ->
     end.
 
 wsloop(WebSocket) ->
+    %io:format("wsloop, path: ~p~n",[WebSocket:get(path)]),
     %% Get the data sent from the client
     Data = WebSocket:get_data(),
     %% Our example...
