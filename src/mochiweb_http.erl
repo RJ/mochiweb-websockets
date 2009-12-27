@@ -27,8 +27,8 @@ set_defaults(Defaults, PropList) ->
     lists:foldl(fun set_default/2, PropList, Defaults).
 
 parse_options(Options) ->
-    {loop, WwwLoop} = proplists:lookup(loop, Options),
-    {wsloop, WSLoop} = proplists:lookup(wsloop, Options),
+    WwwLoop = proplists:get_value(loop, Options),
+    WSLoop  = proplists:get_value(wsloop, Options),
     Loop = fun (S) ->
                    ?MODULE:loop(S, {WwwLoop,WSLoop})
            end,
