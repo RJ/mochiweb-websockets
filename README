@@ -1,1 +1,15 @@
 MochiWeb is an Erlang library for building lightweight HTTP servers.
+
+--
+
+I've added websockets support to mochiweb such that you can use the same port
+for ws: as you can for normal web requests.
+
+Consult examples/websocket/src/websocket_web.erl to see how you define a loop
+specifically for handling websocket connections.
+
+This is based on from http://github.com/davebryson/erlang_websocket 
+The main difference is that my version uses one port and avoids running a 
+distinct service for ws: - it upgrades normal mochiweb connections.
+
+
