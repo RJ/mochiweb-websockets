@@ -4,18 +4,18 @@
 %%
 -module(websocket_request,[Socket]).
 
--export([get/1,get_data/0,send/1]).
+-export([get/1, get_data/0, send/1]).
 
 %% Get the Socket if you need it
-get(socket) -> Socket;
+get(socket) -> Socket.
 
 %% Return the data from the Socket. Parse it from the WebSocket format
 get_data() ->
     case gen_tcp:recv(Socket, 0) of
-	{ok,Data} ->
-	    unframe(binary_to_list(Data));
+	    {ok,Data} ->
+	        unframe(binary_to_list(Data));
         _Other ->
-	    exit(normal)
+	        exit(normal)
     end.
 
 %% Send the data to the client. Format it in the WebSocket format
