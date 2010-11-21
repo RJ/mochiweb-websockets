@@ -269,7 +269,7 @@ range_skip_length(Spec, Size) ->
 websocket_init(Socket, Path, Headers, OriginValidator) ->
     Origin   = mochiweb_headers:get_value("origin", Headers),
     %% If origin is invalid, just uncerimoniously close the socket
-    case Origin /= undefiend andalso OriginValidator(Origin) == true of
+    case Origin =/= undefined andalso OriginValidator(Origin) == true of
         true ->
             websocket_init_with_origin_validated(Socket, Path, Headers, Origin);
         false ->
