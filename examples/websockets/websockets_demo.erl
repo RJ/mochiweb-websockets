@@ -1,4 +1,4 @@
--module(websockets_active).
+-module(websockets_demo).
 -author('author <rj@metabrew.com>').
 
 -export([start/0, start/1, stop/0, loop/2, wsloop_active/1]).
@@ -28,13 +28,20 @@ start(Options) ->
 stop() ->
     mochiweb_http:stop(?MODULE).
 
-wsloop_active(Pid) ->
-    
-    Ret = mochiweb_websocket_delegate:send(Pid, "WELCOME MSG FROM THE SERVER!"),
-    io:format("Sent welcome msg: ~p~n",[Ret]),
-    wsloop_active0(Pid).
+wsloop_active(WSReq) ->
+    % assuming you set a "session" cookie as part of your http login stuff
+    io:format("session cookie: ~p~n", [WSReq:get_cookie_value("session")]),
+    WSReq:send("WELCOME MSG FROM THE SERVER!"),
+    % send some misc info to demonstrate the WSReq API
+    Info = [ "Here's what the server knows about the connection:",
+             "\nget(peername) = " , io_lib:format("~p",[WSReq:get(peername)]),
+             "\nget(path) = " ,     io_lib:format("~p",[WSReq:get(path)]),
+             "\nget(type) = " ,     io_lib:format("~p",[WSReq:get(type)]),
+             "\nget(headers) = " ,  io_lib:format("~p",[WSReq:get(headers)]) ],
+    WSReq:send(Info),
+    wsloop_active0(WSReq).
 
-wsloop_active0(Pid) ->
+wsloop_active0(WSReq) ->
     receive
         closed ->
             io:format("client api got closed~n",[]),
@@ -44,11 +51,11 @@ wsloop_active0(Pid) ->
             ok;
         {frame, Frame} ->
             Msg = ["Dear client, thanks for sending us this msg: ", Frame],
-            mochiweb_websocket_delegate:send(Pid, Msg),
-            wsloop_active0(Pid)
-    after 10000 ->
-            mochiweb_websocket_delegate:send(Pid, "IDLE!"),
-            wsloop_active0(Pid)
+            WSReq:send(Msg),
+            wsloop_active0(WSReq)
+    after 15000 ->
+            WSReq:send("IDLE!"),
+            wsloop_active0(WSReq)
     end.
 
 loop(Req, DocRoot) ->

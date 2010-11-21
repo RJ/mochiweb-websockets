@@ -17,9 +17,7 @@
 -module(mochiweb_websocket_delegate).
 -behaviour(gen_server).
 
--record(state, {path, 
-                headers, 
-                legacy,
+-record(state, {legacy,     % version of websocket protocol
                 socket, 
                 dest, 
                 buffer, 
@@ -30,12 +28,12 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
--export([start_link/3, go/2, send/2, close/1, headers/1, path/1]).
+-export([start_link/1, go/2, send/2, close/1]).
 
 %%
 
-start_link(Path, Headers, Destination) ->
-    gen_server:start_link(?MODULE, [Path, Headers, Destination], []).
+start_link(Destination) ->
+    gen_server:start_link(?MODULE, [Destination], []).
 
 go(Pid, Socket) ->
     ok = mochiweb_socket:controlling_process(Socket, Pid),
@@ -47,19 +45,11 @@ send(Pid, Msg) ->
 close(Pid) ->
     gen_server:call(Pid, close).
 
-headers(Pid) ->
-    gen_server:call(Pid, headers).
-
-path(Pid) ->
-    gen_server:call(Pid, path).
-
 %%
 
-init([Path, Headers, Dest]) ->
+init([Dest]) ->
     process_flag(trap_exit, true),
-    {ok, #state{path=Path, 
-                legacy=true,
-                headers=Headers, 
+    {ok, #state{legacy=true, 
                 dest=Dest, 
                 ft = undefined,
                 buffer = <<>>,
@@ -69,10 +59,6 @@ init([Path, Headers, Dest]) ->
 handle_call(close, _From, State) ->
     mochiweb_socket:close(State#state.socket),
     {reply, ok, State};    
-handle_call(headers, _From, State) ->
-    {reply, State#state.headers, State};
-handle_call(path, _From, State) ->
-    {reply, State#state.path, State};
 handle_call({send, Msg}, _From, State = #state{legacy=false, socket=Socket}) ->
     % header is 0xFF then 64bit big-endian int of the msg length
     Len = iolist_size(Msg),

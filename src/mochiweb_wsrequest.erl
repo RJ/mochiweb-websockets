@@ -1,67 +1,45 @@
 %% @author Richard Jones <rj@metabrew.com>
-%% @see http://www.whatwg.org/specs/web-socket-protocol/
-%% As of August 2010
-%%
-%% However, at time of writing (Oct 8, 2010) Chrome 6 and Firefox 4 implement
-%% an older version of the websocket spec, where messages are framed 0x00...0xFF
-%% so the newer protocol with length headers has not been tested with a browser.
+%% Websocket Request wrapper. this is passed to the ws_loop in client code.
+%% It talks to mochiweb_websocket_delegate, but hides the pid from the client.
+%% and has cache of useful properties.
+-module(mochiweb_wsrequest, [Pid, Path, Headers, Peername, SocketType]).
 
--module(mochiweb_wsrequest, [Socket, Path, Headers]).
--define(TIMEOUT, 999999). % TODO
--export([get/1, get_data/0, send/1]).
+-export([send/1, close/0, get/1, get_header_value/1, get_cookie_value/1]).
 
-get(path)   -> Path;
-get(socket) -> Socket.
+-define(SAVE_COOKIE, mochiweb_request_cookie).
 
-get_data() ->
-    % read FrameType byte
-    case mochiweb_socket:recv(Socket, 1, ?TIMEOUT) of
-        {error, closed} -> 
-            closed;
-        {error, timeout} -> 
-            timeout;
-        {ok, FrameType}  ->
-            case FrameType of
-                <<255>> -> % Modern UTF-8 bytestream message with 64bit length
-                    erlang:put(legacy, false), 
-                    {ok, <<Len:64/unsigned-integer>>}  = 
-                        mochiweb_socket:recv(Socket, 8, ?TIMEOUT),
-                    {ok, Frame} = mochiweb_socket:recv(Socket, Len, ?TIMEOUT),
-                    {frame, Frame};
-                <<0>> ->   % modern close request, or older no-length-frame msg
-                    case mochiweb_socket:recv(Socket, 1, ?TIMEOUT) of
-                        {ok, <<0>>} ->
-                            % invalid for legacy protocol
-                            % probably followed by 7 more 0 in modern
-                            closing;
-                        {ok, <<255>>} ->
-                            % empty legacy frame.
-                            erlang:put(legacy, true), 
-                            {frame, <<>>};
-                        {ok, Byte2} ->
-                            % Read up to the first 0xFF for the body
-                            erlang:put(legacy, true),
-                            Body = read_until_FF(Socket, Byte2),
-                            {frame, Body}
-                    end
-            end
-    end.
+get(path)       -> Path;
+get(headers)    -> Headers;
+get(peername)   -> Peername;
+get(type)       -> SocketType.  % plain or ssl
 
-send(Body)  ->
-    case erlang:get(legacy) of
-        true ->
-            % legacy spec, msgs are framed with 0x00..0xFF
-            mochiweb_socket:send(Socket, [0, Body, 255]);
-        _  -> 
-            % header is 0xFF then 64bit big-endian int of the msg length
-            Len = iolist_size(Body),
-            mochiweb_socket:send(Socket, [255, 
-                                          <<Len:64/unsigned-integer>>,
-                                          Body])
-    end.
+send(Msg)       -> mochiweb_websocket_delegate:send(Pid, Msg).
 
-read_until_FF(Socket, Acc) when is_binary(Acc) ->
-    case mochiweb_socket:recv(Socket, 1, ?TIMEOUT) of
-        {ok, <<255>>} -> Acc;
-        {ok, B}       -> read_until_FF(Socket, <<Acc/binary, B/binary>>)
+close()         -> mochiweb_websocket_delegate:close(Pid).
+
+%% @spec get_header_value(K) -> undefined | Value
+%% @doc Get the value of a given request header.
+get_header_value(K) ->
+    mochiweb_headers:get_value(K, Headers).
+
+%% @spec get_cookie_value(Key::string) -> string() | undefined
+%% @doc Get the value of the given cookie.
+get_cookie_value(Key) ->
+    proplists:get_value(Key, parse_cookie()).
+
+%% @spec parse_cookie() -> [{Key::string(), Value::string()}]
+%% @doc Parse the cookie header.
+parse_cookie() ->
+    case erlang:get(?SAVE_COOKIE) of
+        undefined ->
+            Cookies = case get_header_value("cookie") of
+                          undefined ->
+                              [];
+                          Value ->
+                              mochiweb_cookies:parse_cookie(Value)
+                      end,
+            put(?SAVE_COOKIE, Cookies),
+            Cookies;
+        Cached ->
+            Cached
     end.

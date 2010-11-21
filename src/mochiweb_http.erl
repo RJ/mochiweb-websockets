@@ -22,7 +22,6 @@
 
 -record(body, {http_loop,                   % normal http handler fun
                websocket_loop,              % websocket handler fun
-               websocket_active,            % boolean: active or passive api
                websocket_origin_validator   % fun(Origin) -> true/false
               }). 
 
@@ -32,17 +31,14 @@ parse_options(Options) ->
         WsProps when is_list(WsProps) ->
             WsLoop   = proplists:get_value(loop, WsProps),
             WsOrigin = proplists:get_value(origin_validator, WsProps, 
-                                           ?DEFAULT_ORIGIN_VALIDATOR),
-            WsActive = proplists:get_value(active, WsProps, false);
+                                           ?DEFAULT_ORIGIN_VALIDATOR);
         _ ->
             WsLoop   = undefined,
-            WsOrigin = undefined,
-            WsActive = undefined
+            WsOrigin = undefined
     end,
     Body = #body{http_loop                  = HttpLoop,
                  websocket_loop             = WsLoop,
-                 websocket_origin_validator = WsOrigin,
-                 websocket_active           = WsActive},
+                 websocket_origin_validator = WsOrigin},
     Loop = fun (S) -> ?MODULE:loop(S, Body) end,
     Options1 = [{loop, Loop} | 
                     proplists:delete(loop, 
@@ -148,7 +144,7 @@ headers(Socket, Request, Headers, Body, HeaderCount) ->
             H = mochiweb_headers:make(Headers),
             case is_websocket_upgrade_requested(H) of
                 true ->
-                    headers_ws_upgrade(Socket, Request, Headers, Body, H);
+                    headers_ws_upgrade(Socket, Request, Body, H);
                 false ->
                     Req = mochiweb:new_request({Socket, Request,
                                                 lists:reverse(Headers)}),
@@ -175,25 +171,17 @@ is_websocket_upgrade_requested(H) ->
     Hdr("upgrade") == "websocket" andalso Hdr("connection") == "upgrade".
 
 % entered once we've seen valid websocket upgrade headers
-headers_ws_upgrade(Socket, Request, Headers, Body, H) ->
+headers_ws_upgrade(Socket, Request, Body, H) ->
     {_, {abs_path,Path}, _} = Request,
     OriginValidator = Body#body.websocket_origin_validator,
     % websocket_init will exit() if anything looks fishy
     websocket_init(Socket, Path, H, OriginValidator),
-    case Body#body.websocket_active of
-        true ->
-            {ok, WSPid} = mochiweb_websocket_delegate:start_link(Path,H,self()),
-            mochiweb_websocket_delegate:go(WSPid, Socket),
-            call_body(Body#body.websocket_loop, WSPid);
-        false ->
-            WsReq = mochiweb_wsrequest:new(Socket, Path, H),
-            call_body(Body#body.websocket_loop, WsReq);
-        undefined ->
-            % what is the correct way to respond when a server doesn't
-            % support websockets, but the client requests the upgrade?
-            % use a 400 for now:
-            handle_invalid_request(Socket, Request, Headers)
-    end.
+    {ok, WSPid} = mochiweb_websocket_delegate:start_link(self()),
+    Peername = mochiweb_socket:peername(Socket),
+    Type = mochiweb_socket:type(Socket),
+    WSReq = mochiweb_wsrequest:new(WSPid, Path, H, Peername, Type),
+    mochiweb_websocket_delegate:go(WSPid, Socket),
+    call_body(Body#body.websocket_loop, WSReq).
 
 call_body({M, F}, Req) ->
     M:F(Req);
