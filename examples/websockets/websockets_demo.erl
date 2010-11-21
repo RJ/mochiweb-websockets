@@ -14,8 +14,7 @@ start(Options) ->
                            true
                       end,
     % websocket options
-    WsOpts  = [ {active, true},
-                {origin_validator, OriginValidator},
+    WsOpts  = [ {origin_validator, OriginValidator},
                 {loop,   {?MODULE, wsloop_active}} ],
     %
     Ssl = [ {ssl, true}, {ssl_opts, [ {certfile, "../https/server_cert.pem"},
