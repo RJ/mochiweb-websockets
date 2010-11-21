@@ -55,6 +55,16 @@ start() ->
     start([{ip, "127.0.0.1"},
            {loop, {?MODULE, default_body}}]).
 
+%% @spec start(Options) -> ServerRet
+%%     Options = [option()]
+%%     Option = {name, atom()} | {ip, string() | tuple()} | {backlog, integer()}
+%%              | {nodelay, boolean()} | {acceptor_pool_size, integer()}
+%%              | {ssl, boolean()} | {profile_fun, undefined | (Props) -> ok}
+%% @doc Start a mochiweb server.
+%%      profile_fun is used to profile accept timing.
+%%      After each accept, if defined, profile_fun is called with a proplist of a subset of the mochiweb_socket_server state and timing information.
+%%      The proplist is as follows: [{name, Name}, {port, Port}, {active_sockets, ActiveSockets}, {timing, Timing}].
+%% @end
 start(Options) ->
     mochiweb_socket_server:start(parse_options(Options)).
 
@@ -110,22 +120,23 @@ loop(Socket, Body) ->
     request(Socket, Body).
 
 request(Socket, Body) ->
-    case mochiweb_socket:recv(Socket, 0, ?REQUEST_RECV_TIMEOUT) of
-        {ok, {http_request, Method, Path, Version}} ->
+    mochiweb_socket:setopts(Socket, [{active, once}]),
+    receive
+        {Protocol, _, {http_request, Method, Path, Version}} when Protocol == http orelse Protocol == ssl ->
             mochiweb_socket:setopts(Socket, [{packet, httph}]),
             headers(Socket, {Method, Path, Version}, [], Body, 0);
-        {error, {http_error, "\r\n"}} ->
+        {Protocol, _, {http_error, "\r\n"}} when Protocol == http orelse Protocol == ssl ->
             request(Socket, Body);
-        {error, {http_error, "\n"}} ->
+        {Protocol, _, {http_error, "\n"}} when Protocol == http orelse Protocol == ssl ->
             request(Socket, Body);
-        {error, closed} ->
-            mochiweb_socket:close(Socket),
-            exit(normal);
-        {error, timeout} ->
+        {tcp_closed, _} ->
             mochiweb_socket:close(Socket),
             exit(normal);
         _Other ->
             handle_invalid_request(Socket)
+    after ?REQUEST_RECV_TIMEOUT ->
+        mochiweb_socket:close(Socket),
+        exit(normal)
     end.
 
 reentry(Body) ->
@@ -138,27 +149,29 @@ headers(Socket, Request, Headers, _Body, ?MAX_HEADERS) ->
     mochiweb_socket:setopts(Socket, [{packet, raw}]),
     handle_invalid_request(Socket, Request, Headers);
 headers(Socket, Request, Headers, Body, HeaderCount) ->
-    case mochiweb_socket:recv(Socket, 0, ?HEADERS_RECV_TIMEOUT) of
-        {ok, http_eoh} ->
-            mochiweb_socket:setopts(Socket, [{packet, raw}]),
-            H = mochiweb_headers:make(Headers),
-            case is_websocket_upgrade_requested(H) of
+    mochiweb_socket:setopts(Socket, [{active, once}]),
+    receive
+        {Protocol, _, http_eoh} when Protocol == http orelse Protocol == ssl ->
+            MHeaders = mochiweb_headers:make(Headers),
+            case is_websocket_upgrade_requested(MHeaders) of
                 true ->
-                    headers_ws_upgrade(Socket, Request, Body, H);
+                    headers_ws_upgrade(Socket, Request, Body, MHeaders);
                 false ->
-                    Req = mochiweb:new_request({Socket, Request,
-                                                lists:reverse(Headers)}),
+                    Req = new_request(Socket, Request, Headers),
                     call_body(Body#body.http_loop, Req),
                     ?MODULE:after_response(Body, Req)
             end;
-        {ok, {http_header, _, Name, _, Value}} ->
+        {Protocol, _, {http_header, _, Name, _, Value}} when Protocol == http orelse Protocol == ssl ->
             headers(Socket, Request, [{Name, Value} | Headers], Body,
                     1 + HeaderCount);
-        {error, closed} ->
+        {tcp_closed, _} ->
             mochiweb_socket:close(Socket),
             exit(normal);
         _Other ->
             handle_invalid_request(Socket, Request, Headers)
+    after ?HEADERS_RECV_TIMEOUT ->
+        mochiweb_socket:close(Socket),
+        exit(normal)
     end.
 
 % checks if these headers are a valid websocket upgrade request
@@ -172,6 +185,7 @@ is_websocket_upgrade_requested(H) ->
 
 % entered once we've seen valid websocket upgrade headers
 headers_ws_upgrade(Socket, Request, Body, H) ->
+    mochiweb_socket:setopts(Socket, [{packet, raw}]),
     {_, {abs_path,Path}, _} = Request,
     OriginValidator = Body#body.websocket_origin_validator,
     % websocket_init will exit() if anything looks fishy
@@ -192,12 +206,14 @@ handle_invalid_request(Socket) ->
     handle_invalid_request(Socket, {'GET', {abs_path, "/"}, {0,9}}, []).
 
 handle_invalid_request(Socket, Request, RevHeaders) ->
-    mochiweb_socket:setopts(Socket, [{packet, raw}]),
-    Req = mochiweb:new_request({Socket, Request,
-                                lists:reverse(RevHeaders)}),
+    Req = new_request(Socket, Request, RevHeaders),
     Req:respond({400, [], []}),
     mochiweb_socket:close(Socket),
     exit(normal).
+
+new_request(Socket, Request, RevHeaders) ->
+    mochiweb_socket:setopts(Socket, [{packet, raw}]),
+    mochiweb:new_request({Socket, Request, lists:reverse(RevHeaders)}).
 
 after_response(Body, Req) ->
     Socket = Req:get(socket),
@@ -267,6 +283,8 @@ websocket_init_with_origin_validated(Socket, Path, Headers, _Origin) ->
     Key1     = mochiweb_headers:get_value("Sec-Websocket-Key1", Headers),
     Key2     = mochiweb_headers:get_value("Sec-Websocket-Key2", Headers),
     %% read the 8 random bytes sent after the client headers for websockets:
+    %% TODO should we catch {error,closed} here and exit(normal) to avoid 
+    %%      logging a crash when the client prematurely disconnects?
     {ok, Key3} = mochiweb_socket:recv(Socket, 8, ?HEADERS_RECV_TIMEOUT),
     {N1,S1} = parse_seckey(Key1),
     {N2,S2} = parse_seckey(Key2),
@@ -310,7 +328,7 @@ parse_seckey1("", {NumStr,NumSpaces}) ->
     {list_to_integer(lists:reverse(NumStr)), NumSpaces};
 parse_seckey1([32|T], {Ret,NumSpaces}) -> % ASCII/dec space
     parse_seckey1(T, {Ret, 1+NumSpaces});
-parse_seckey1([N|T],  {Ret,NumSpaces}) when N >= 48, N =< 57 -> % ASCII/dec 0-9 
+parse_seckey1([N|T],  {Ret,NumSpaces}) when N >= $0, N =< $9 -> 
     parse_seckey1(T, {[N|Ret], NumSpaces});
 parse_seckey1([_|T], Acc) -> 
     parse_seckey1(T, Acc).

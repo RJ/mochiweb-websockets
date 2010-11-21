@@ -404,8 +404,8 @@ destack(TagName, Stack) when is_list(Stack) ->
                         {_, []} ->
                             %% Actually was a singleton
                             Stack;
-                        {Pre, [{T1, A1, []} | Post1]} ->
-                            [{T0, A0, [{T1, A1, lists:reverse(Pre)} | Post1]}
+                        {Pre, [{T1, A1, Acc1} | Post1]} ->
+                            [{T0, A0, [{T1, A1, Acc1 ++ lists:reverse(Pre)} | Post1]}
                              | Post0]
                     end;
                 _ ->
@@ -476,10 +476,51 @@ tokenize_attr_value(Attr, B, S) ->
     case B of
         <<_:O/binary, "=", _/binary>> ->
             S2 = skip_whitespace(B, ?INC_COL(S1)),
-            tokenize_word_or_literal(B, S2);
+            tokenize_quoted_or_unquoted_attr_value(B, S2);
         _ ->
             {Attr, S1}
     end.
+    
+tokenize_quoted_or_unquoted_attr_value(B, S=#decoder{offset=O}) ->
+    case B of
+        <<_:O/binary>> ->
+            { [], S };
+        <<_:O/binary, Q, _/binary>> when Q =:= ?QUOTE orelse
+                                         Q =:= ?SQUOTE ->
+            tokenize_quoted_attr_value(B, ?INC_COL(S), [], Q);
+        <<_:O/binary, _/binary>> ->
+            tokenize_unquoted_attr_value(B, S, [])
+    end.
+    
+tokenize_quoted_attr_value(B, S=#decoder{offset=O}, Acc, Q) ->
+    case B of
+        <<_:O/binary>> ->
+            { iolist_to_binary(lists:reverse(Acc)), S };
+        <<_:O/binary, $&, _/binary>> ->
+            {{data, Data, false}, S1} = tokenize_charref(B, ?INC_COL(S)),
+            tokenize_quoted_attr_value(B, S1, [Data|Acc], Q);
+        <<_:O/binary, Q, _/binary>> ->
+            { iolist_to_binary(lists:reverse(Acc)), ?INC_COL(S) };
+        <<_:O/binary, $\n, _/binary>> ->
+            { iolist_to_binary(lists:reverse(Acc)), ?INC_LINE(S) };
+        <<_:O/binary, C, _/binary>> ->
+            tokenize_quoted_attr_value(B, ?INC_COL(S), [C|Acc], Q)
+    end.
+    
+tokenize_unquoted_attr_value(B, S=#decoder{offset=O}, Acc) ->
+    case B of
+        <<_:O/binary>> ->
+            { iolist_to_binary(lists:reverse(Acc)), S };
+        <<_:O/binary, $&, _/binary>> ->
+            {{data, Data, false}, S1} = tokenize_charref(B, ?INC_COL(S)),
+            tokenize_unquoted_attr_value(B, S1, [Data|Acc]);
+        <<_:O/binary, $/, $>, _/binary>> ->
+            { iolist_to_binary(lists:reverse(Acc)), S };
+        <<_:O/binary, C, _/binary>> when ?PROBABLE_CLOSE(C) ->
+            { iolist_to_binary(lists:reverse(Acc)), S };
+        <<_:O/binary, C, _/binary>> ->
+            tokenize_unquoted_attr_value(B, ?INC_COL(S), [C|Acc])
+    end.   
 
 skip_whitespace(B, S=#decoder{offset=O}) ->
     case B of
@@ -489,8 +530,17 @@ skip_whitespace(B, S=#decoder{offset=O}) ->
             S
     end.
 
-tokenize_literal(Bin, S) ->
-    tokenize_literal(Bin, S, []).
+tokenize_literal(Bin, S=#decoder{offset=O}) ->
+    case Bin of
+        <<_:O/binary, C, _/binary>> when C =:= $>
+                                    orelse C =:= $/
+                                    orelse C =:= $= ->
+            %% Handle case where tokenize_literal would consume
+            %% 0 chars. http://github.com/mochi/mochiweb/pull/13
+            {[C], ?INC_COL(S)};
+        _ ->
+            tokenize_literal(Bin, S, [])
+    end.
 
 tokenize_literal(Bin, S=#decoder{offset=O}, Acc) ->
     case Bin of
@@ -526,6 +576,10 @@ find_qgt(Bin, S=#decoder{offset=O}) ->
     case Bin of
         <<_:O/binary, "?>", _/binary>> ->
             ?ADV_COL(S, 2);
+        <<_:O/binary, ">", _/binary>> ->
+			?ADV_COL(S, 1);
+        <<_:O/binary, "/>", _/binary>> ->
+			?ADV_COL(S, 2);
         %% tokenize_attributes takes care of this state:
         %% <<_:O/binary, C, _/binary>> ->
         %%     find_qgt(Bin, ?INC_CHAR(S, C));
@@ -603,7 +657,7 @@ tokenize_word_or_literal(Bin, S=#decoder{offset=O}) ->
             tokenize_word(Bin, ?INC_COL(S), C);
         <<_:O/binary, C, _/binary>> when not ?IS_WHITESPACE(C) ->
             %% Sanity check for whitespace
-            tokenize_literal(Bin, S, [])
+            tokenize_literal(Bin, S)
     end.
 
 tokenize_word(Bin, S, Quote) ->
@@ -1098,6 +1152,12 @@ doctype_test() ->
        mochiweb_html:parse("<html>"
                            "<!DOCTYPE html PUBLIC \"-//W3C//DTD HTML 4.01 Transitional//EN\" \"http://www.w3.org/TR/html4/loose.dtd\">"
                            "<head></head></body></html>")),
+    %% http://github.com/mochi/mochiweb/pull/13
+    ?assertEqual(
+       {<<"html">>,[],[{<<"head">>,[],[]}]},
+       mochiweb_html:parse("<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.0 Transitional//EN\"/>"
+                           "<html>"
+                           "<head></head></body></html>")),
     ok.
 
 dumb_br_test() ->
@@ -1128,4 +1188,77 @@ php_test() ->
          "<div><?php\n?></div>")),
     ok.
 
+parse_unquoted_attr_test() ->
+    D0 = <<"<html><img src=/images/icon.png/></html>">>,
+    ?assertEqual(
+        {<<"html">>,[],[
+            { <<"img">>, [ { <<"src">>, <<"/images/icon.png">> } ], [] }
+        ]},
+        mochiweb_html:parse(D0)),
+    
+    D1 = <<"<html><img src=/images/icon.png></img></html>">>,
+        ?assertEqual(
+            {<<"html">>,[],[
+                { <<"img">>, [ { <<"src">>, <<"/images/icon.png">> } ], [] }
+            ]},
+            mochiweb_html:parse(D1)),
+    
+    D2 = <<"<html><img src=/images/icon&gt;.png width=100></img></html>">>,
+        ?assertEqual(
+            {<<"html">>,[],[
+                { <<"img">>, [ { <<"src">>, <<"/images/icon>.png">> }, { <<"width">>, <<"100">> } ], [] }
+            ]},
+            mochiweb_html:parse(D2)),
+    ok.        
+    
+parse_quoted_attr_test() ->    
+    D0 = <<"<html><img src='/images/icon.png'></html>">>,
+    ?assertEqual(
+        {<<"html">>,[],[
+            { <<"img">>, [ { <<"src">>, <<"/images/icon.png">> } ], [] }
+        ]},
+        mochiweb_html:parse(D0)),     
+        
+    D1 = <<"<html><img src=\"/images/icon.png'></html>">>,
+    ?assertEqual(
+        {<<"html">>,[],[
+            { <<"img">>, [ { <<"src">>, <<"/images/icon.png'></html>">> } ], [] }
+        ]},
+        mochiweb_html:parse(D1)),     
+
+    D2 = <<"<html><img src=\"/images/icon&gt;.png\"></html>">>,
+    ?assertEqual(
+        {<<"html">>,[],[
+            { <<"img">>, [ { <<"src">>, <<"/images/icon>.png">> } ], [] }
+        ]},
+        mochiweb_html:parse(D2)),     
+    ok.
+
+parse_missing_attr_name_test() ->
+    D0 = <<"<html =black></html>">>,
+    ?assertEqual(
+        {<<"html">>, [ { <<"=">>, <<"=">> }, { <<"black">>, <<"black">> } ], [] },
+       mochiweb_html:parse(D0)),
+    ok.
+
+parse_broken_pi_test() ->
+	D0 = <<"<html><?xml:namespace prefix = o ns = \"urn:schemas-microsoft-com:office:office\" /></html>">>,
+	?assertEqual(
+		{<<"html">>, [], [
+			{ pi, <<"xml:namespace">>, [ { <<"prefix">>, <<"o">> }, 
+			                             { <<"ns">>, <<"urn:schemas-microsoft-com:office:office">> } ] }
+		] },
+		mochiweb_html:parse(D0)),
+	ok.
+
+parse_funny_singletons_test() ->
+	D0 = <<"<html><input><input>x</input></input></html>">>,
+	?assertEqual(
+		{<<"html">>, [], [
+			{ <<"input">>, [], [] },
+			{ <<"input">>, [], [ <<"x">> ] }
+		] },
+		mochiweb_html:parse(D0)),
+	ok.
+    
 -endif.
