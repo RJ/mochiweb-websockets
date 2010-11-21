@@ -17,12 +17,32 @@
 -define(DEFAULTS, [{name, ?MODULE},
                    {port, 8888}]).
 
+%% unless specified, we accept any origin:
+-define(DEFAULT_ORIGIN_VALIDATOR, fun(_Origin) -> true end).
+
+-record(body, {http_loop,                   % normal http handler fun
+               websocket_loop,              % websocket handler fun
+               websocket_origin_validator   % fun(Origin) -> true/false
+              }). 
+
 parse_options(Options) ->
-    {loop, HttpLoop} = proplists:lookup(loop, Options),
-    Loop = fun (S) ->
-                   ?MODULE:loop(S, HttpLoop)
-           end,
-    Options1 = [{loop, Loop} | proplists:delete(loop, Options)],
+    HttpLoop = proplists:get_value(loop, Options),
+    case proplists:get_value(websocket_opts, Options) of
+        WsProps when is_list(WsProps) ->
+            WsLoop   = proplists:get_value(loop, WsProps),
+            WsOrigin = proplists:get_value(origin_validator, WsProps, 
+                                           ?DEFAULT_ORIGIN_VALIDATOR);
+        _ ->
+            WsLoop   = undefined,
+            WsOrigin = undefined
+    end,
+    Body = #body{http_loop                  = HttpLoop,
+                 websocket_loop             = WsLoop,
+                 websocket_origin_validator = WsOrigin},
+    Loop = fun (S) -> ?MODULE:loop(S, Body) end,
+    Options1 = [{loop, Loop} | 
+                    proplists:delete(loop, 
+                        proplists:delete(websocket_opts, Options))],
     mochilists:set_defaults(?DEFAULTS, Options1).
 
 stop() ->
@@ -132,9 +152,15 @@ headers(Socket, Request, Headers, Body, HeaderCount) ->
     mochiweb_socket:setopts(Socket, [{active, once}]),
     receive
         {Protocol, _, http_eoh} when Protocol == http orelse Protocol == ssl ->
-            Req = new_request(Socket, Request, Headers),
-            call_body(Body, Req),
-            ?MODULE:after_response(Body, Req);
+            MHeaders = mochiweb_headers:make(Headers),
+            case is_websocket_upgrade_requested(MHeaders) of
+                true ->
+                    headers_ws_upgrade(Socket, Request, Body, MHeaders);
+                false ->
+                    Req = new_request(Socket, Request, Headers),
+                    call_body(Body#body.http_loop, Req),
+                    ?MODULE:after_response(Body, Req)
+            end;
         {Protocol, _, {http_header, _, Name, _, Value}} when Protocol == http orelse Protocol == ssl ->
             headers(Socket, Request, [{Name, Value} | Headers], Body,
                     1 + HeaderCount);
@@ -147,6 +173,29 @@ headers(Socket, Request, Headers, Body, HeaderCount) ->
         mochiweb_socket:close(Socket),
         exit(normal)
     end.
+
+% checks if these headers are a valid websocket upgrade request
+is_websocket_upgrade_requested(H) ->
+    Hdr = fun(K) -> case mochiweb_headers:get_value(K, H) of
+                        undefined         -> undefined;
+                        V when is_list(V) -> string:to_lower(V)
+                    end
+          end,
+    Hdr("upgrade") == "websocket" andalso Hdr("connection") == "upgrade".
+
+% entered once we've seen valid websocket upgrade headers
+headers_ws_upgrade(Socket, Request, Body, H) ->
+    mochiweb_socket:setopts(Socket, [{packet, raw}]),
+    {_, {abs_path,Path}, _} = Request,
+    OriginValidator = Body#body.websocket_origin_validator,
+    % websocket_init will exit() if anything looks fishy
+    websocket_init(Socket, Path, H, OriginValidator),
+    {ok, WSPid} = mochiweb_websocket_delegate:start_link(self()),
+    Peername = mochiweb_socket:peername(Socket),
+    Type = mochiweb_socket:type(Socket),
+    WSReq = mochiweb_wsrequest:new(WSPid, Path, H, Peername, Type),
+    mochiweb_websocket_delegate:go(WSPid, Socket),
+    call_body(Body#body.websocket_loop, WSReq).
 
 call_body({M, F}, Req) ->
     M:F(Req);
@@ -215,6 +264,96 @@ range_skip_length(Spec, Size) ->
             invalid_range
     end.
 
+%% Respond to the websocket upgrade request with valid signature
+%% or exit() if any of the sec- headers look suspicious.
+websocket_init(Socket, Path, Headers, OriginValidator) ->
+    Origin   = mochiweb_headers:get_value("origin", Headers),
+    %% If origin is invalid, just uncerimoniously close the socket
+    case Origin /= undefiend andalso OriginValidator(Origin) == true of
+        true ->
+            websocket_init_with_origin_validated(Socket, Path, Headers, Origin);
+        false ->
+            mochiweb_socket:close(Socket),
+            exit(websocket_origin_check_failed)
+    end.
+
+websocket_init_with_origin_validated(Socket, Path, Headers, _Origin) ->    
+    Host     = mochiweb_headers:get_value("Host", Headers),
+    SubProto = mochiweb_headers:get_value("Sec-Websocket-Protocol", Headers),
+    Key1     = mochiweb_headers:get_value("Sec-Websocket-Key1", Headers),
+    Key2     = mochiweb_headers:get_value("Sec-Websocket-Key2", Headers),
+    %% read the 8 random bytes sent after the client headers for websockets:
+    %% TODO should we catch {error,closed} here and exit(normal) to avoid 
+    %%      logging a crash when the client prematurely disconnects?
+    {ok, Key3} = mochiweb_socket:recv(Socket, 8, ?HEADERS_RECV_TIMEOUT),
+    {N1,S1} = parse_seckey(Key1),
+    {N2,S2} = parse_seckey(Key2),
+    ok = websocket_verify_parsed_sec({N1,S1}, {N2,S2}),
+    Part1 = erlang:round(N1/S1),
+    Part2 = erlang:round(N2/S2),
+    Sig = crypto:md5( <<Part1:32/unsigned-integer, Part2:32/unsigned-integer,
+                        Key3/binary>> ),
+    Proto = case mochiweb_socket:type(Socket) of 
+                ssl   -> "wss://"; 
+                plain -> "ws://" 
+            end,
+    SubProtoHeader = case SubProto of 
+                         undefined  -> ""; 
+                         P          -> ["Sec-WebSocket-Protocol: ", P, "\r\n"]
+                     end,
+    HttpScheme = case mochiweb_socket:type(Socket) of 
+                     plain -> "http"; 
+                     ssl   -> "https" 
+                 end,
+    Data = ["HTTP/1.1 101 Web Socket Protocol Handshake\r\n",
+            "Upgrade: WebSocket\r\n",
+            "Connection: Upgrade\r\n",
+            "Sec-WebSocket-Location: ", Proto,Host,Path, "\r\n",
+            "Sec-WebSocket-Origin: ", HttpScheme, "://", Host, "\r\n",
+            SubProtoHeader,
+            "\r\n",
+            <<Sig/binary>>
+           ],
+    mochiweb_socket:send(Socket, Data),
+    ok.
+            
+%% websocket seckey parser:
+%% extract integer by only looking at [0-9]+ in the string
+%% count spaces in the string
+%% returns: {int, numspaces}
+parse_seckey(Str) ->
+    parse_seckey1(Str, {"",0}).
+
+parse_seckey1("", {NumStr,NumSpaces}) ->
+    {list_to_integer(lists:reverse(NumStr)), NumSpaces};
+parse_seckey1([32|T], {Ret,NumSpaces}) -> % ASCII/dec space
+    parse_seckey1(T, {Ret, 1+NumSpaces});
+parse_seckey1([N|T],  {Ret,NumSpaces}) when N >= $0, N =< $9 -> 
+    parse_seckey1(T, {[N|Ret], NumSpaces});
+parse_seckey1([_|T], Acc) -> 
+    parse_seckey1(T, Acc).
+
+%% exit if anything suspicious is detected
+websocket_verify_parsed_sec({N1,S1}, {N2,S2}) ->
+    case N1 > 4294967295 orelse 
+         N2 > 4294967295 orelse 
+         S1 == 0 orelse
+         S2 == 0 of
+        true ->
+            %%  This is a symptom of an attack.
+            exit(websocket_attack);
+        false ->
+            case N1 rem S1 /= 0 orelse
+                 N2 rem S2 /= 0 of
+                true ->
+                    %% This can only happen if the client is not a conforming
+                    %% WebSocket client.
+                    exit(websocket_client_misspoke);
+                false ->
+                    ok
+            end
+    end.
+  
 %%
 %% Tests
 %%
