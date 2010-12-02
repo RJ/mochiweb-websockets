@@ -20,9 +20,9 @@
 %% unless specified, we accept any origin:
 -define(DEFAULT_ORIGIN_VALIDATOR, fun(_Origin) -> true end).
 
--record(body, {http_loop,                   % normal http handler fun
-               websocket_loop,              % websocket handler fun
-               websocket_origin_validator   % fun(Origin) -> true/false
+-record(body, {http_loop,                   %% normal http handler fun
+               websocket_loop,              %% websocket handler fun
+               websocket_origin_validator   %% fun(Origin) -> true/false
               }). 
 
 parse_options(Options) ->
@@ -174,7 +174,7 @@ headers(Socket, Request, Headers, Body, HeaderCount) ->
         exit(normal)
     end.
 
-% checks if these headers are a valid websocket upgrade request
+%% checks if these headers are a valid websocket upgrade request
 is_websocket_upgrade_requested(H) ->
     Hdr = fun(K) -> case mochiweb_headers:get_value(K, H) of
                         undefined         -> undefined;
@@ -183,12 +183,12 @@ is_websocket_upgrade_requested(H) ->
           end,
     Hdr("upgrade") == "websocket" andalso Hdr("connection") == "upgrade".
 
-% entered once we've seen valid websocket upgrade headers
+%% entered once we've seen valid websocket upgrade headers
 headers_ws_upgrade(Socket, Request, Body, H) ->
     mochiweb_socket:setopts(Socket, [{packet, raw}]),
     {_, {abs_path,Path}, _} = Request,
     OriginValidator = Body#body.websocket_origin_validator,
-    % websocket_init will exit() if anything looks fishy
+    %% websocket_init will exit() if anything looks fishy
     websocket_init(Socket, Path, H, OriginValidator),
     {ok, WSPid} = mochiweb_websocket_delegate:start_link(self()),
     Peername = mochiweb_socket:peername(Socket),
@@ -282,10 +282,19 @@ websocket_init_with_origin_validated(Socket, Path, Headers, _Origin) ->
     SubProto = mochiweb_headers:get_value("Sec-Websocket-Protocol", Headers),
     Key1     = mochiweb_headers:get_value("Sec-Websocket-Key1", Headers),
     Key2     = mochiweb_headers:get_value("Sec-Websocket-Key2", Headers),
-    %% read the 8 random bytes sent after the client headers for websockets:
-    %% TODO should we catch {error,closed} here and exit(normal) to avoid 
-    %%      logging a crash when the client prematurely disconnects?
-    {ok, Key3} = mochiweb_socket:recv(Socket, 8, ?HEADERS_RECV_TIMEOUT),
+    %% Read the 8 random bytes sent after the client headers for websockets:
+    %%
+    %% NB: We we catch {error,closed} here to avoid logging a crash when 
+    %%     the client prematurely disconnects without completing the handshake
+    %%     and sending the necessary headers.
+    case mochiweb_socket:recv(Socket, 8, ?HEADERS_RECV_TIMEOUT) of
+        {error, closed} ->
+            %% Client prematurely closed the connection
+            Key3 = undefined,
+            exit(normal);
+        {ok, Key3} ->
+            ok
+    end,
     {N1,S1} = parse_seckey(Key1),
     {N2,S2} = parse_seckey(Key2),
     ok = websocket_verify_parsed_sec({N1,S1}, {N2,S2}),
@@ -359,6 +368,13 @@ websocket_verify_parsed_sec({N1,S1}, {N2,S2}) ->
 %%
 -include_lib("eunit/include/eunit.hrl").
 -ifdef(TEST).
+
+websocket_seckey_test() ->
+    SecWebsocketKey1 = "L895cg 0  @_2  H>216 >",
+    SecWebsocketKey2 = "1sZ  }\" 1*  5 29   @ 4Tr2732 j *",
+    {89502216,6}     = (catch parse_seckey(SecWebsocketKey1)),
+    {1152942732,12}  = (catch parse_seckey(SecWebsocketKey2)), 
+    ok.
 
 range_test() ->
     %% valid, single ranges

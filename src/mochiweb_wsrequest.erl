@@ -1,6 +1,6 @@
 %% @author Richard Jones <rj@metabrew.com>
 %% Websocket Request wrapper. this is passed to the ws_loop in client code.
-%% It talks to mochiweb_websocket_delegate, but hides the pid from the client.
+%% It talks to mochiweb_websocket_delegate, but hides the pid from the client
 %% and has cache of useful properties.
 %% Parts of API copied from mochiweb_request.erl
 %%

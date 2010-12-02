@@ -17,13 +17,14 @@
 -module(mochiweb_websocket_delegate).
 -behaviour(gen_server).
 
--record(state, {legacy,     % version of websocket protocol
-                socket, 
-                dest, 
-                buffer, 
-                partial,
-                ft, 
-                flen}).
+-record(state, {legacy,     %% version of websocket protocol
+                socket,     %% mochiweb_socket 
+                dest,       %% pid of client api process, destination for frames
+                buffer,     %% rcv buffer
+                partial,    %% current partially received frame
+                ft,         %% frame type. 
+                flen        %% current frame length, if known 
+               }).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
@@ -47,25 +48,26 @@ close(Pid) ->
 
 %%
 
+
 init([Dest]) ->
     process_flag(trap_exit, true),
-    {ok, #state{legacy=true, 
-                dest=Dest, 
-                ft = undefined,
-                buffer = <<>>,
-                partial= <<>>
+    {ok, #state{legacy  = true,
+                dest    = Dest, 
+                ft      = undefined,
+                buffer  = <<>>,
+                partial = <<>>
                }}.
 
 handle_call(close, _From, State) ->
     mochiweb_socket:close(State#state.socket),
     {reply, ok, State};    
 handle_call({send, Msg}, _From, State = #state{legacy=false, socket=Socket}) ->
-    % header is 0xFF then 64bit big-endian int of the msg length
+    %% header is 0xFF then 64bit big-endian int of the msg length
     Len = iolist_size(Msg),
     R = mochiweb_socket:send(Socket, [255, <<Len:64/unsigned-integer>>, Msg]), 
     {reply, R, State};
 handle_call({send, Msg}, _From, State = #state{legacy=true, socket=Socket}) ->
-    % legacy spec, msgs are framed with 0x00..0xFF
+    %% legacy spec, msgs are framed with 0x00..0xFF
     R = mochiweb_socket:send(Socket, [0, Msg, 255]),
     {reply, R, State}.
 
@@ -76,21 +78,17 @@ handle_cast({go, Socket}, State) ->
 handle_info({'EXIT', _, _}, State) ->
     State#state.dest ! closed,
     {stop, normal, State};
-handle_info({ssl_closed, _Sock}, State) ->
+handle_info({Closed, _Sock}, State) when Closed =:= tcp_closed; 
+                                         Closed =:= ssl_closed ->
     State#state.dest ! closed,
     {stop, normal, State};
-handle_info({tcp_closed, _Sock}, State) ->
-    State#state.dest ! closed,
-    {stop, normal, State};
-handle_info({tcp_error, _Sock, Reason}, State) ->
+handle_info({Error, _Sock, Reason}, State) when Error =:= tcp_error;
+                                                Error =:= ssl_error ->
     State#state.dest ! {error, Reason},
     State#state.dest ! closed,
     {stop, normal, State};
-handle_info({ssl_error, _Sock, Reason}, State) ->
-    State#state.dest ! {error, Reason},
-    State#state.dest ! closed,
-    {stop, normal, State};
-handle_info({tcp, Sock, Data}, State = #state{socket=Sock, buffer=Buffer}) ->
+handle_info({SockType, S, Data}, State = #state{socket=S, buffer=Buffer}) when SockType =:= tcp; 
+                                                                               SockType =:= ssl ->
     NewState = process_data(State#state{buffer= <<Buffer/binary,Data/binary>>}),
     {noreply, NewState};
 handle_info({ssl, _Sock, Data}, State = #state{buffer=Buffer}) ->
@@ -111,23 +109,25 @@ process_data(State = #state{buffer= <<>>}) ->
 process_data(State = #state{buffer= <<FrameType:8,Buffer/binary>>, ft=undefined}) ->
     process_data(State#state{buffer=Buffer, ft=FrameType, partial= <<>>});
 
-% "Legacy" frames, 0x00...0xFF
-% or modern closing handshake 0x00{8}
+%% "Legacy" frames, 0x00...0xFF
+%% or modern closing handshake 0x00{8}
 process_data(State = #state{buffer= <<0,0,0,0,0,0,0,0, Buffer/binary>>, ft=0}) ->
     State#state.dest ! closing_handshake,
     process_data(State#state{buffer=Buffer, ft=undefined});
 
 process_data(State = #state{buffer= <<255, Rest/binary>>, ft=0}) ->
-    % message received in full
+    %% message received in full
     State#state.dest ! {frame, State#state.partial},
     process_data(State#state{partial= <<>>, ft=undefined, buffer=Rest});
 
 process_data(State = #state{buffer= <<Byte:8, Rest/binary>>, ft=0, partial=Partial}) ->
-    NewPartial = case Partial of <<>> -> <<Byte>> ; _ -> <<Partial/binary, <<Byte>>/binary>> end,
-    NewState = State#state{buffer=Rest, partial=NewPartial},
-   process_data(NewState);
+    NewPartial = case Partial of 
+                     <<>> -> <<Byte>>; 
+                     _    -> <<Partial/binary, <<Byte>>/binary>> 
+                 end,
+   process_data(State#state{buffer=Rest, partial=NewPartial});
 
-% "Modern" frames, starting with 0xFF, followed by 64 bit length
+%% "Modern" frames, starting with 0xFF, followed by 64 bit length
 process_data(State = #state{buffer= <<Len:64/unsigned-integer,Buffer/binary>>, ft=255, flen=undefined}) ->
     BitsLen = Len*8,
     case Buffer of
@@ -149,3 +149,45 @@ process_data(State = #state{buffer=Buffer, ft=255, flen=Len}) when is_integer(Le
         _ ->
             State#state{flen=Len, buffer=Buffer}
     end.
+
+%%
+%% Tests
+%%
+-include_lib("eunit/include/eunit.hrl").
+-ifdef(TEST).
+
+websocket_frame_parser_test() ->
+    %% simulate arrival of frames split over multiple messages
+    %% Check it yields 3 frame messages, and the fragment is left in the buffer
+    Packets = [<<0,"what on earth is a quaid?",255>>,
+               <<0,"the quick ">>,
+               <<"brown fox jumps ">>,
+               <<"over the lazy dog",255>>,
+               <<0,"and what's so good about smints?",255>>,
+               <<0,"fragment">>],
+    FakeState = #state{ legacy=true, 
+                        dest=self(),  %% send to ourselves for testing
+                        ft=undefined,
+                        buffer= <<>>,
+                        partial= <<>> },
+    FinalState = lists:foldl(fun(Packet, State=#state{buffer=Buffer}) ->
+                                process_data(State#state{buffer= <<Buffer/binary,Packet/binary>>})
+                            end, FakeState, Packets),
+    %% check we were sent 3 frame messages
+    {frame, <<"what on earth is a quaid?">>} = receive_once(),
+    {frame, <<"the quick brown fox jumps over the lazy dog">>} = receive_once(),
+    {frame, <<"and what's so good about smints?">>} = receive_once(),
+    undefined = receive_once(),
+    %% and that the fragment is left over
+    <<"fragment">> = FinalState#state.partial,
+    <<>>           = FinalState#state.buffer,
+    ok.
+
+receive_once() ->
+    receive 
+        X -> X
+    after 0 ->
+        undefined
+    end.
+
+-endif.
